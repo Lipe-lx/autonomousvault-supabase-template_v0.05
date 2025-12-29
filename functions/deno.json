@@ -1,0 +1,17 @@
+{
+    "compilerOptions": {
+        "allowJs": true,
+        "lib": [
+            "deno.window"
+        ],
+        "strict": true,
+        "noEmit": true
+    },
+    "imports": {
+        "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2",
+        "crypto-js": "https://esm.sh/crypto-js@4"
+    },
+    "include": [
+        "./**/*.ts"
+    ]
+}

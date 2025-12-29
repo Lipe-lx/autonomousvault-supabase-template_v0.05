@@ -9,7 +9,10 @@
     },
     "imports": {
         "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2",
-        "crypto-js": "https://esm.sh/crypto-js@4"
+        "crypto-js": "https://esm.sh/crypto-js@4",
+        "ethers": "npm:ethers@6.10.0",
+        "msgpack-lite": "npm:msgpack-lite@0.1.26",
+        "std/": "https://deno.land/std@0.168.0/"
     },
     "include": [
         "./**/*.ts"

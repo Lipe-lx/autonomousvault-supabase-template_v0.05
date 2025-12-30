@@ -1,3 +1,4 @@
+
 // AutonomousVault Edge Functions - Shared Supabase Client
 // functions/_shared/supabase.ts
 

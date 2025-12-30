@@ -4,7 +4,7 @@
 // Executes a single dealer analysis cycle
 // SECURITY: Keys are decrypted in-memory only, cleared after use
 
-import { serve } from 'std/http/server.ts';
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createSupabaseClientWithAuth, getUserIdFromAuth } from '../_shared/supabase.ts';
 import { withDecryptedKey } from '../_shared/crypto.ts';
 import { handleCors, jsonResponse, errorResponse } from '../_shared/cors.ts';
@@ -19,7 +19,7 @@ import {
 import { getMarketContext } from '../_shared/market-data.ts';
 import { analyzeMarket, AIProviderConfig } from '../_shared/ai-adapter.ts';
 import { executeTrade } from '../_shared/hyperliquid-adapter.ts';
-import { ethers } from 'ethers';
+import { ethers } from 'npm:ethers@6.10.0';
 
 /**
  * Request body for dealer cycle

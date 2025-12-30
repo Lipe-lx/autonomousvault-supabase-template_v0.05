@@ -22,6 +22,16 @@ import { executeTrade } from '../_shared/hyperliquid-adapter.ts';
 import { ethers } from 'npm:ethers@6.10.0';
 
 /**
+ * Indicator configuration
+ */
+interface IndicatorConfig {
+    enabled: boolean;
+    period?: number;
+    overbought?: number;
+    oversold?: number;
+}
+
+/**
  * Request body for dealer cycle
  */
 interface DealerCycleRequest {
@@ -33,8 +43,37 @@ interface DealerCycleRequest {
         maxLeverage?: number;
         maxPositionSizeUSDC?: number;
         aggressiveMode?: boolean;
+        // Timeframe settings
+        analysisTimeframe?: string;
+        historyCandles?: number;
+        // Macro Timeframe (multi-TF analysis)
+        macroTimeframeEnabled?: boolean;
+        macroTimeframe?: string;
+        macroEnabledIndicators?: string[];
+        // Indicators
+        indicatorSettings?: Record<string, IndicatorConfig>;
+        autonomousIndicators?: boolean;
+        // Risk Management
+        stopLossEnabled?: boolean;
+        stopLossPercent?: number;
+        takeProfitEnabled?: boolean;
+        takeProfitPercent?: number;
+        // Strategy
+        strategyPrompt?: string;
     };
     aiConfig: AIProviderConfig;
+    // Portfolio context for position-aware decisions
+    portfolioContext?: {
+        balance: number;
+        positions: Array<{
+            coin: string;
+            side: 'LONG' | 'SHORT';
+            size: number;
+            entryPrice: number;
+            unrealizedPnl: number;
+            leverage: number;
+        }>;
+    };
     // Required for trade execution
     encryptedKey?: string;
     encryptionSalt?: string;
@@ -103,70 +142,132 @@ serve(async (req: Request) => {
             );
         }
 
-        // Execute analysis for each coin
+        // Execute analysis with chunked processing
         const decisions: DealerCycleResponse['decisions'] = [];
+        const CHUNK_SIZE = 5;
 
-        // Build market context for all coins
-        const marketContexts: any[] = [];
-        for (const coin of body.coins) {
-            try {
-                const context = await getMarketContext(coin);
-                marketContexts.push({ ...context, coin });
-            } catch (e) {
-                console.error(`Failed to get market data for ${coin}:`, e);
-            }
-        }
-
-        // Call Strategy Oracle (Vendor's proprietary logic)
-        const STRATEGY_ORACLE_URL = 'https://rhkkqojnaiyrxmiiykay.supabase.co/functions/v1/strategy-oracle';
+        // Get positions from request or empty array
+        const currentPositions = body.portfolioContext?.positions || [];
         
-        let oracleDecisions: any[] = [];
-        try {
-            const oracleResponse = await fetch(STRATEGY_ORACLE_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    marketContext: { coins: marketContexts },
-                    aiConfig: body.aiConfig,
-                    portfolioContext: {
-                        maxOpenPositions: body.settings.maxPositions,
-                        maxLeverage: body.settings.maxLeverage || 5,
-                        currentPositions: [] // Could be fetched from user's state
-                    }
-                })
-            });
-
-            if (oracleResponse.ok) {
-                const oracleData = await oracleResponse.json();
-                oracleDecisions = oracleData.decisions || [];
-            } else {
-                console.error('Strategy Oracle error:', await oracleResponse.text());
-            }
-        } catch (oracleError) {
-            console.error('Strategy Oracle call failed:', oracleError);
+        // Split coins into chunks
+        const chunks: string[][] = [];
+        for (let i = 0; i < body.coins.length; i += CHUNK_SIZE) {
+            chunks.push(body.coins.slice(i, i + CHUNK_SIZE));
         }
 
-        // Process Oracle decisions and execute trades
-        for (const oracleDecision of oracleDecisions) {
-            const coin = oracleDecision.asset;
-            const action = oracleDecision.action;
-            const confidence = oracleDecision.confidence || 0;
-            const reason = oracleDecision.reason || '';
-            const marketContext = marketContexts.find(c => c.coin === coin);
-            const currentPrice = marketContext?.currentPrice || 0;
+        console.log(`[DealerCycle] Processing ${body.coins.length} coins in ${chunks.length} chunks`);
 
-            const decision: DealerCycleResponse['decisions'][number] = {
-                coin,
-                action,
-                confidence,
-                reason,
-                executed: false,
-                marketPrice: currentPrice
-            };
+        // Process each chunk
+        for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+            const chunkCoins = chunks[chunkIndex];
+            console.log(`[DealerCycle] Processing chunk ${chunkIndex + 1}/${chunks.length}: ${chunkCoins.join(', ')}`);
 
-            // Skip low confidence decisions
-            if (confidence < 0.6 || action === 'HOLD') {
-                decisions.push(decision);
+            // Build market context for chunk
+            const marketContexts: Array<{
+                coin: string;
+                currentPrice: number;
+                indicators?: Record<string, unknown>;
+                openPosition?: {
+                    hasPosition: boolean;
+                    side?: 'LONG' | 'SHORT';
+                    size?: number;
+                    entryPrice?: number;
+                    unrealizedPnl?: number;
+                };
+            }> = [];
+
+            for (const coin of chunkCoins) {
+                try {
+                    const context = await getMarketContext(coin);
+                    
+                    // Inject position data for this coin
+                    const matchingPosition = currentPositions.find(p => p.coin === coin);
+                    const enrichedContext = {
+                        ...context,
+                        coin,
+                        openPosition: matchingPosition ? {
+                            hasPosition: true,
+                            side: matchingPosition.side,
+                            size: matchingPosition.size,
+                            entryPrice: matchingPosition.entryPrice,
+                            unrealizedPnl: matchingPosition.unrealizedPnl
+                        } : { hasPosition: false }
+                    };
+                    
+                    marketContexts.push(enrichedContext);
+                } catch (e) {
+                    console.error(`Failed to get market data for ${coin}:`, e);
+                }
+            }
+
+            if (marketContexts.length === 0) continue;
+
+            // Call Strategy Oracle for this chunk
+            const STRATEGY_ORACLE_URL = 'https://rhkkqojnaiyrxmiiykay.supabase.co/functions/v1/strategy-oracle';
+            
+            try {
+                const oracleResponse = await fetch(STRATEGY_ORACLE_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        marketContext: { 
+                            coins: marketContexts,
+                            settings: {
+                                analysisTimeframe: body.settings.analysisTimeframe || '60',
+                                macroTimeframeEnabled: body.settings.macroTimeframeEnabled,
+                                macroTimeframe: body.settings.macroTimeframe,
+                                indicatorSettings: body.settings.indicatorSettings,
+                                stopLossEnabled: body.settings.stopLossEnabled,
+                                stopLossPercent: body.settings.stopLossPercent,
+                                takeProfitEnabled: body.settings.takeProfitEnabled,
+                                takeProfitPercent: body.settings.takeProfitPercent
+                            }
+                        },
+                        aiConfig: body.aiConfig,
+                        portfolioContext: {
+                            maxOpenPositions: body.settings.maxPositions,
+                            maxLeverage: body.settings.maxLeverage || 5,
+                            currentPositions: currentPositions,
+                            balance: body.portfolioContext?.balance || 0
+                        }
+                    })
+                });
+
+                if (oracleResponse.ok) {
+                    const oracleData = await oracleResponse.json();
+                    const chunkDecisions = oracleData.decisions || [];
+                    
+                    // Process decisions from this chunk
+                    for (const oracleDecision of chunkDecisions) {
+                        const coin = oracleDecision.asset;
+                        const marketContext = marketContexts.find(c => c.coin === coin);
+                        
+                        decisions.push({
+                            coin,
+                            action: oracleDecision.action,
+                            confidence: oracleDecision.confidence || 0,
+                            reason: oracleDecision.reason || '',
+                            executed: false,
+                            marketPrice: marketContext?.currentPrice || 0
+                        });
+                    }
+                } else {
+                    console.error('Strategy Oracle error:', await oracleResponse.text());
+                }
+            } catch (oracleError) {
+                console.error('Strategy Oracle call failed:', oracleError);
+            }
+
+            // Small delay between chunks to avoid rate limiting
+            if (chunkIndex < chunks.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+        }
+
+        // Execute trades for actionable decisions
+        for (const decision of decisions) {
+            // Skip if already executed or not actionable
+            if (decision.executed || decision.confidence < 0.6 || decision.action === 'HOLD') {
                 continue;
             }
 
@@ -179,6 +280,7 @@ serve(async (req: Request) => {
                 try {
                     // Calculate Position Size
                     const maxUsdc = body.settings.maxPositionSizeUSDC || 10;
+                    const currentPrice = decision.marketPrice || 1;
                     const size = maxUsdc / currentPrice;
 
                     // Decrypt key and execute trade
@@ -186,12 +288,12 @@ serve(async (req: Request) => {
                         body.encryptedKey,
                         body.executionPassword,
                         body.encryptionSalt || '',
-                        async (privateKey) => {
+                        async (privateKey: string) => {
                             const wallet = new ethers.Wallet(privateKey);
                             return await executeTrade(
                                 wallet,
-                                coin,
-                                action === 'BUY',
+                                decision.coin,
+                                decision.action === 'BUY',
                                 size,
                                 currentPrice,
                                 { orderType: 'limit', price: currentPrice }
@@ -206,14 +308,12 @@ serve(async (req: Request) => {
                         decision.error = orderResult.error;
                     }
                 } catch (execError) {
-                    console.error(`Execution failed for ${coin}:`, execError);
+                    console.error(`Execution failed for ${decision.coin}:`, execError);
                     decision.error = execError instanceof Error
                         ? execError.message
                         : 'Trade execution failed';
                 }
             }
-
-            decisions.push(decision);
         }
 
         // Record usage

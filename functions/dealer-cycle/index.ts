@@ -17,7 +17,7 @@ import {
 
 // Adapters
 import { getMarketContext } from '../_shared/market-data.ts';
-import { analyzeMarket, AIProviderConfig } from '../_shared/ai-adapter.ts';
+import { AIProviderConfig } from '../_shared/ai-adapter.ts'; // Type only
 import { executeTrade } from '../_shared/hyperliquid-adapter.ts';
 import { ethers } from 'npm:ethers@6.10.0';
 
@@ -106,85 +106,114 @@ serve(async (req: Request) => {
         // Execute analysis for each coin
         const decisions: DealerCycleResponse['decisions'] = [];
 
+        // Build market context for all coins
+        const marketContexts: any[] = [];
         for (const coin of body.coins) {
             try {
-                // 1. Fetch Market Context
-                const marketContext = await getMarketContext(coin);
-                const currentPrice = marketContext.currentPrice || 0;
-
-                // 2. AI Analysis
-                const analysis = await analyzeMarket(marketContext, body.aiConfig);
-
-                const decision: DealerCycleResponse['decisions'][number] = {
-                    coin,
-                    action: analysis.signal as any, // Map 'BULLISH'/'BEARISH' to 'BUY'/'SELL' if needed
-                    confidence: analysis.confidence,
-                    reason: analysis.reason,
-                    executed: false,
-                    marketPrice: currentPrice
-                };
-
-                // Map AI Signal to Action
-                let action: 'BUY' | 'SELL' | 'CLOSE' | 'HOLD' = 'HOLD';
-                if (analysis.signal === 'BULLISH' && analysis.confidence > 0.7) action = 'BUY';
-                if (analysis.signal === 'BEARISH' && analysis.confidence > 0.7) action = 'SELL';
-                decision.action = action;
-
-                // 3. Execution (if enabled and signal is strong)
-                if (
-                    body.executeTradesIfSignal &&
-                    action !== 'HOLD' &&
-                    body.encryptedKey &&
-                    body.executionPassword
-                ) {
-                    try {
-                        // Calculate Position Size
-                        const maxUsdc = body.settings.maxPositionSizeUSDC || 10;
-                        const size = maxUsdc / currentPrice; // Simple size calc
-
-                        // Decrypt key and execute trade
-                        const orderResult = await withDecryptedKey(
-                            body.encryptedKey,
-                            body.executionPassword,
-                            body.encryptionSalt || '', // handle missing salt if needed
-                            async (privateKey) => {
-                                const wallet = new ethers.Wallet(privateKey);
-                                return await executeTrade(
-                                    wallet,
-                                    coin,
-                                    action === 'BUY',
-                                    size,
-                                    currentPrice,
-                                    { orderType: 'limit', price: currentPrice } // Limit order at current price
-                                );
-                            }
-                        );
-
-                        if (orderResult.success) {
-                            decision.executed = true;
-                            decision.orderId = orderResult.orderId;
-                        } else {
-                            decision.error = orderResult.error;
-                        }
-                    } catch (execError) {
-                        console.error(`Execution failed for ${coin}:`, execError);
-                        decision.error = execError instanceof Error
-                            ? execError.message
-                            : 'Trade execution failed';
-                    }
-                }
-
-                decisions.push(decision);
-
-            } catch (coinError) {
-                console.error(`Cycle failed for ${coin}:`, coinError);
-                decisions.push({
-                    coin,
-                    action: 'HOLD',
-                    confidence: 0,
-                    reason: coinError instanceof Error ? coinError.message : 'Analysis failed',
-                });
+                const context = await getMarketContext(coin);
+                marketContexts.push({ ...context, coin });
+            } catch (e) {
+                console.error(`Failed to get market data for ${coin}:`, e);
             }
+        }
+
+        // Call Strategy Oracle (Vendor's proprietary logic)
+        const STRATEGY_ORACLE_URL = 'https://rhkkqojnaiyrxmiiykay.supabase.co/functions/v1/strategy-oracle';
+        
+        let oracleDecisions: any[] = [];
+        try {
+            const oracleResponse = await fetch(STRATEGY_ORACLE_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    marketContext: { coins: marketContexts },
+                    aiConfig: body.aiConfig,
+                    portfolioContext: {
+                        maxOpenPositions: body.settings.maxPositions,
+                        maxLeverage: body.settings.maxLeverage || 5,
+                        currentPositions: [] // Could be fetched from user's state
+                    }
+                })
+            });
+
+            if (oracleResponse.ok) {
+                const oracleData = await oracleResponse.json();
+                oracleDecisions = oracleData.decisions || [];
+            } else {
+                console.error('Strategy Oracle error:', await oracleResponse.text());
+            }
+        } catch (oracleError) {
+            console.error('Strategy Oracle call failed:', oracleError);
+        }
+
+        // Process Oracle decisions and execute trades
+        for (const oracleDecision of oracleDecisions) {
+            const coin = oracleDecision.asset;
+            const action = oracleDecision.action;
+            const confidence = oracleDecision.confidence || 0;
+            const reason = oracleDecision.reason || '';
+            const marketContext = marketContexts.find(c => c.coin === coin);
+            const currentPrice = marketContext?.currentPrice || 0;
+
+            const decision: DealerCycleResponse['decisions'][number] = {
+                coin,
+                action,
+                confidence,
+                reason,
+                executed: false,
+                marketPrice: currentPrice
+            };
+
+            // Skip low confidence decisions
+            if (confidence < 0.6 || action === 'HOLD') {
+                decisions.push(decision);
+                continue;
+            }
+
+            // Execute trade if enabled and we have valid encryption data
+            if (
+                body.executeTradesIfSignal &&
+                body.encryptedKey &&
+                body.executionPassword
+            ) {
+                try {
+                    // Calculate Position Size
+                    const maxUsdc = body.settings.maxPositionSizeUSDC || 10;
+                    const size = maxUsdc / currentPrice;
+
+                    // Decrypt key and execute trade
+                    const orderResult = await withDecryptedKey(
+                        body.encryptedKey,
+                        body.executionPassword,
+                        body.encryptionSalt || '',
+                        async (privateKey) => {
+                            const wallet = new ethers.Wallet(privateKey);
+                            return await executeTrade(
+                                wallet,
+                                coin,
+                                action === 'BUY',
+                                size,
+                                currentPrice,
+                                { orderType: 'limit', price: currentPrice }
+                            );
+                        }
+                    );
+
+                    if (orderResult.success) {
+                        decision.executed = true;
+                        decision.orderId = orderResult.orderId;
+                    } else {
+                        decision.error = orderResult.error;
+                    }
+                } catch (execError) {
+                    console.error(`Execution failed for ${coin}:`, execError);
+                    decision.error = execError instanceof Error
+                        ? execError.message
+                        : 'Trade execution failed';
+                }
+            }
+
+            decisions.push(decision);
         }
 
         // Record usage

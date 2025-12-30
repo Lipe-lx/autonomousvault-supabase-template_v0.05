@@ -1,8 +1,8 @@
 // Hyperliquid Adapter for Edge Functions
 // functions/_shared/hyperliquid-adapter.ts
 
-import { ethers } from 'ethers';
-import msgpack from 'msgpack-lite';
+import { ethers } from 'npm:ethers@6.10.0';
+import msgpack from 'npm:msgpack-lite@0.1.26';
 import { Buffer } from 'node:buffer';
 
 const IS_MAINNET = false; // Testnet by default for safety
